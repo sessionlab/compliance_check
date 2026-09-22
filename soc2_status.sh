@@ -57,6 +57,15 @@ release_age() {
   if [ "$pos" -eq 0 ]; then echo -1; else echo $((total - pos)); fi
 }
 
+# release_of <version> — release identity ("10.15", "26") for a full version string.
+release_of() {
+  case "$1" in
+    ''|*[!0-9.]*) ;;
+    10.*) printf '%s' "$1" | cut -d. -f1,2 ;;
+    *)    printf '%s' "${1%%.*}" ;;
+  esac
+}
+
 # days_since "<plist date>" — whole days since that timestamp, empty if unparseable.
 days_since() {
   local epoch
@@ -196,6 +205,8 @@ section "Checking macOS version (support window and patch level)..."
 # Being a release or two behind is fine: Apple ships security updates for the
 # newest SUPPORTED_MAJORS releases, so only an out-of-support release fails.
 BEHIND=$(release_age "$OS_RELEASE")
+RELEASE_SUPPORTED=0
+{ [ "$BEHIND" -lt 0 ] || [ "$BEHIND" -lt "$SUPPORTED_MAJORS" ]; } && RELEASE_SUPPORTED=1
 if [ "$BEHIND" -lt 0 ]; then
   report PASS "macOS $OS_VERSION is current"
 elif [ "$BEHIND" -ge "$SUPPORTED_MAJORS" ]; then
@@ -207,16 +218,48 @@ else
 fi
 
 # Patch level, judged only against the installed release. RecommendedUpdates
-# holds the pending minor/security updates; an available major upgrade is
-# advertised separately and is deliberately ignored, so staying on an older
-# supported release is not itself a finding.
+# holds the pending updates, and on some releases that includes the offer to
+# upgrade to a newer major release. Staying on an older but still supported
+# release is not a finding, so those upgrade offers are dropped below.
 SU=/Library/Preferences/com.apple.SoftwareUpdate
 SCAN_AGE=$(days_since "$(pref $SU LastSuccessfulDate)")
 PENDING_LIST=$(pref $SU RecommendedUpdates)
-PENDING_NAMES=$(printf '%s\n' "$PENDING_LIST" \
-  | sed -n 's/.*"Display Name" *= *"\{0,1\}\([^";]*\).*/\1/p' \
-  | sed 's/ *$//' | paste -sd, - | sed 's/,/, /g')
-PENDING_COUNT=$(printf '%s\n' "$PENDING_LIST" | grep -c 'Display Name')
+
+# One "<version>|<display name>" record per pending update.
+PENDING_ENTRIES=$(printf '%s\n' "$PENDING_LIST" | awk '
+  function val(line,   v) {
+    v = line
+    sub(/^[^=]*=[ \t]*/, "", v)
+    sub(/;[ \t]*$/, "", v)
+    gsub(/"/, "", v)
+    sub(/[ \t]+$/, "", v)
+    return v
+  }
+  /"Display Name"/    { name = val($0) }
+  /"Display Version"/ { ver  = val($0) }
+  /}/ { if (name != "") print ver "|" name; name = ""; ver = "" }
+')
+
+PENDING_NAMES=""
+PENDING_COUNT=0
+while IFS='|' read -r ENTRY_VERSION ENTRY_NAME; do
+  [ -n "$ENTRY_NAME" ] || continue
+  # An entry whose version belongs to a macOS release newer than the running one
+  # is a major upgrade offer, not a patch for this release. Ignore it as long as
+  # the running release is still getting security updates. Non-macOS entries
+  # (Safari, XProtect, …) are not listed releases, so they are always reported.
+  ENTRY_RELEASE=$(release_of "$ENTRY_VERSION")
+  if [ "$RELEASE_SUPPORTED" -eq 1 ] && [ -n "$ENTRY_RELEASE" ]; then
+    ENTRY_BEHIND=$(release_age "$ENTRY_RELEASE")
+    if [ "$ENTRY_BEHIND" -ge 0 ] && [ "$BEHIND" -ge 0 ] && [ "$ENTRY_BEHIND" -lt "$BEHIND" ]; then
+      continue
+    fi
+  fi
+  PENDING_COUNT=$((PENDING_COUNT + 1))
+  PENDING_NAMES="${PENDING_NAMES:+$PENDING_NAMES, }$ENTRY_NAME"
+done <<EOF
+$PENDING_ENTRIES
+EOF
 
 if [ -z "$SCAN_AGE" ]; then
   report WARN "Cannot confirm the patch level (no record of a successful update check)"
