@@ -15,7 +15,7 @@ MAX_SCAN_AGE_DAYS=7   # a software-update scan older than this cannot prove the 
 # SUPPORTED_MAJORS entries, so support is judged by position in this list rather
 # than by arithmetic on the version number (15 is followed by 26, not 16).
 # Append new releases as they ship; anything newer than this list counts as
-# current, so an out-of-date copy of this script never nags.
+# current, so an out-of-date copy of this script never nags; anything older fails.
 MACOS_RELEASES="10.13 10.14 10.15 11 12 13 14 15 26 27"
 SUPPORTED_MAJORS=3
 
@@ -47,14 +47,27 @@ is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 # pref <domain> <key> — read a preference, empty if unset.
 pref() { defaults read "$1" "$2" 2>/dev/null; }
 
-# release_age <release> — releases behind the newest known one, -1 if not listed.
+# release_key <release> — sortable number for a release ("10.13" → 1013, "26" → 2600).
+release_key() {
+  local major=${1%%.*} minor=0
+  case "$1" in *.*) minor=${1#*.}; minor=${minor%%.*} ;; esac
+  is_num "$major" && is_num "$minor" || return
+  echo $((10#$major * 100 + 10#$minor))
+}
+
+# release_age <release> — releases behind the newest known one. A release older
+# than the whole list counts as at least that many behind; a newer unknown
+# release, or one that cannot be parsed, gives -1.
 release_age() {
-  local total=0 pos=0 r
+  local total=0 pos=0 r key oldest
   for r in $MACOS_RELEASES; do
     total=$((total + 1))
     [ "$r" = "$1" ] && pos=$total
   done
-  if [ "$pos" -eq 0 ]; then echo -1; else echo $((total - pos)); fi
+  if [ "$pos" -ne 0 ]; then echo $((total - pos)); return; fi
+  key=$(release_key "$1")
+  oldest=$(release_key "${MACOS_RELEASES%% *}")
+  if [ -n "$key" ] && [ "$key" -lt "$oldest" ]; then echo "$total"; else echo -1; fi
 }
 
 # release_of <version> — release identity ("10.15", "26") for a full version string.
@@ -222,7 +235,10 @@ fi
 # upgrade to a newer major release. Staying on an older but still supported
 # release is not a finding, so those upgrade offers are dropped below.
 SU=/Library/Preferences/com.apple.SoftwareUpdate
-SCAN_AGE=$(days_since "$(pref $SU LastSuccessfulDate)")
+LAST_SCAN=$(pref $SU LastFullSuccessfulDate)
+[ -z "$LAST_SCAN" ] && LAST_SCAN=$(pref $SU LastSuccessfulDate)
+[ -z "$LAST_SCAN" ] && LAST_SCAN=$(pref $SU LastBackgroundSuccessfulDate)
+SCAN_AGE=$(days_since "$LAST_SCAN")
 PENDING_LIST=$(pref $SU RecommendedUpdates)
 
 # One "<version>|<display name>" record per pending update.
@@ -276,7 +292,7 @@ section "Checking Automatic Updates settings..."
 
 # "Automatically check for updates" has no reliable preference key on recent
 # macOS, so ask softwareupdate itself.
-if softwareupdate --schedule 2>/dev/null | grep -qi "is turned on"; then
+if softwareupdate --schedule 2>/dev/null | grep -Eqi "is (turned )?on([^a-z]|$)"; then
   report PASS "Automatic update checking is enabled"
 else
   report FAIL "Automatic update checking is disabled"
